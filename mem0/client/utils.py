@@ -6,6 +6,7 @@ from mem0.exceptions import (
     NetworkError,
     create_exception_from_response,
 )
+from functools import wraps
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,6 @@ def api_error_handler(func):
     the most specific exception type with helpful error messages, suggestions,
     and debug information.
     """
-    from functools import wraps
 
     @wraps(func)
     def wrapper(*args, **kwargs):
@@ -38,56 +38,63 @@ def api_error_handler(func):
             return func(*args, **kwargs)
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP error occurred: {e}")
-            
+
+            response = e.response
+            request = e.request
+
             # Extract error details from response
+            response_headers = response.headers
+            response_status = response.status_code
             response_text = ""
             error_details = {}
             debug_info = {
-                "status_code": e.response.status_code,
-                "url": str(e.request.url),
-                "method": e.request.method,
+                "status_code": response_status,
+                "url": str(request.url),
+                "method": request.method,
             }
-            
+
+            content_type = response_headers.get("content-type", "")
             try:
-                response_text = e.response.text
+                response_text = response.text
                 # Try to parse JSON response for additional error details
-                if e.response.headers.get("content-type", "").startswith("application/json"):
-                    error_data = json.loads(response_text)
+                if content_type.startswith("application/json"):
+                    # Avoid double-parsing - use .json() if possible
+                    try:
+                        error_data = response.json()
+                    except Exception:
+                        error_data = json.loads(response_text)
                     if isinstance(error_data, dict):
                         error_details = error_data
                         response_text = error_data.get("detail", response_text)
-            except (json.JSONDecodeError, AttributeError):
-                # Fallback to plain text response
+            except (json.JSONDecodeError, AttributeError, Exception):
                 pass
-            
-            # Add rate limit information if available
-            if e.response.status_code == 429:
-                retry_after = e.response.headers.get("Retry-After")
-                if retry_after:
+
+            if response_status == 429:
+                retry_after = response_headers.get("Retry-After")
+                if retry_after is not None:
                     try:
                         debug_info["retry_after"] = int(retry_after)
                     except ValueError:
                         pass
-                
-                # Add rate limit headers if available
-                for header in ["X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"]:
-                    value = e.response.headers.get(header)
-                    if value:
+
+                # Collect all headers in one pass, then extract rate limit info
+                rl_headers = {"X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"}
+                for header, value in response_headers.items():
+                    if header in rl_headers:
                         debug_info[header.lower().replace("-", "_")] = value
-            
+
             # Create specific exception based on status code
             exception = create_exception_from_response(
-                status_code=e.response.status_code,
+                status_code=response_status,
                 response_text=response_text,
                 details=error_details,
                 debug_info=debug_info,
             )
-            
             raise exception
-            
+
         except httpx.RequestError as e:
             logger.error(f"Request error occurred: {e}")
-            
+
             # Determine the appropriate exception type based on error type
             if isinstance(e, httpx.TimeoutException):
                 raise NetworkError(
